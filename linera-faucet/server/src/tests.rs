@@ -3,7 +3,11 @@
 
 #![allow(clippy::large_futures)]
 
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use futures::lock::Mutex;
 use linera_base::{
@@ -143,6 +147,7 @@ impl FaucetTestEnv {
         let root = MutationRoot {
             faucet_storage: Arc::clone(&faucet_storage),
             pending_requests: Arc::clone(&pending_requests),
+            pending_owners: pending_owners.clone(),
             request_notifier: Arc::clone(&request_notifier),
             storage: client.storage_client().clone(),
             initial_claim_amount: config.initial_claim_amount,
@@ -194,11 +199,13 @@ impl FaucetTestEnv {
         batch_config: BatchProcessorConfig,
     ) -> (MutationRoot<environment::TestStorage>, BatchProcessorHandle) {
         let pending_requests = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_owners = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let request_notifier = Arc::new(Notify::new());
 
         let root = MutationRoot {
             faucet_storage: Arc::clone(faucet_storage),
             pending_requests: Arc::clone(&pending_requests),
+            pending_owners: pending_owners.clone(),
             request_notifier: Arc::clone(&request_notifier),
             storage: self.client.storage_client().clone(),
             initial_claim_amount: self.root.initial_claim_amount,
@@ -385,6 +392,7 @@ async fn test_batch_size_reduction_on_limit_errors() -> anyhow::Result<()> {
 
     // Create and queue 3 pending requests
     {
+        let pending_owners_for_test = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let mut pending_requests_guard = pending_requests.lock().await;
         for owner in owners {
             let (tx, _rx) = oneshot::channel();
@@ -395,6 +403,7 @@ async fn test_batch_size_reduction_on_limit_errors() -> anyhow::Result<()> {
                 amount: Amount::from_tokens(1),
                 daily_period: 0,
                 responder: tx,
+                pending_owners: Arc::clone(&pending_owners_for_test),
                 #[cfg(with_metrics)]
                 queued_at: std::time::Instant::now(),
             });
