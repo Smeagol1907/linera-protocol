@@ -8,8 +8,7 @@
 
 mod database;
 
-use std::{collections::VecDeque, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc};
-
+use std::{collections::{HashSet, VecDeque}, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Context as _;
 use async_graphql::{EmptySubscription, Error, Schema, SimpleObject};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
@@ -215,7 +214,7 @@ pub struct QueryRoot<C: ClientContext> {
 /// The root GraphQL mutation type.
 pub struct MutationRoot<S> {
     faucet_storage: Arc<FaucetDatabase>,
-    pending_requests: Arc<Mutex<VecDeque<PendingRequest>>>,
+    pending_requests: Arc<Mutex<VecDeque<PendingRequest>>>, pending_owners: Arc<std::sync::Mutex<HashSet<AccountOwner>>>,
     request_notifier: Arc<Notify>,
     storage: S,
     /// Amount for initial claims (chain creation).
@@ -277,7 +276,7 @@ struct PendingRequest {
     amount: Amount,
     /// For daily claims, the period number to store.
     daily_period: u64,
-    responder: oneshot::Sender<PendingResponse>,
+    responder: oneshot::Sender<PendingResponse>, pending_owners: Arc<std::sync::Mutex<HashSet<AccountOwner>>>,
     #[cfg(with_metrics)]
     queued_at: std::time::Instant,
 }
@@ -287,7 +286,7 @@ impl PendingRequest {
         self.target_chain_id.is_some()
     }
 
-    fn send_err(self, err: Error) {
+    fn send_err(self, err: Error) { self.pending_owners.lock().unwrap().remove(&self.owner);
         let response = if self.is_daily() {
             PendingResponse::Daily(Err(err))
         } else {
@@ -493,6 +492,11 @@ where
             return get_chain_description_from_storage(&self.storage, existing_chain_id).await;
         }
 
+        // Reject a duplicate claim already in flight for this owner.
+        if !self.pending_owners.lock().unwrap().insert(owner) {
+            return Err(Error::new(DUPLICATE_CHAIN_MSG));
+        }
+
         // Create a oneshot channel to receive the result.
         let (tx, rx) = oneshot::channel();
 
@@ -506,6 +510,7 @@ where
                 amount: self.initial_claim_amount,
                 daily_period: 0,
                 responder: tx,
+                pending_owners: Arc::clone(&self.pending_owners),
                 #[cfg(with_metrics)]
                 queued_at: std::time::Instant::now(),
             });
@@ -606,6 +611,10 @@ where
         amount: Amount,
         daily_period: u64,
     ) -> Result<ClaimOutcome, Error> {
+        // Reject a duplicate daily claim already in flight for this owner.
+        if !self.pending_owners.lock().unwrap().insert(owner) {
+            return Err(Error::new(DAILY_LIMIT_MSG));
+        }
         // Create a oneshot channel to receive the result.
         let (tx, rx) = oneshot::channel();
 
@@ -619,6 +628,7 @@ where
                 amount,
                 daily_period,
                 responder: tx,
+                pending_owners: Arc::clone(&self.pending_owners),
                 #[cfg(with_metrics)]
                 queued_at: std::time::Instant::now(),
             });
@@ -1110,7 +1120,7 @@ where
                     request.owner
                 ))))
             };
-            if request.responder.send(response).is_err() {
+            request.pending_owners.lock().unwrap().remove(&request.owner); if request.responder.send(response).is_err() {
                 tracing::warn!(
                     "Receiver dropped while sending response to {}.",
                     request.owner
@@ -1149,7 +1159,7 @@ where
     faucet_storage: Arc<FaucetDatabase>,
     storage_path: PathBuf,
     /// Batching components
-    pending_requests: Arc<Mutex<VecDeque<PendingRequest>>>,
+    pending_requests: Arc<Mutex<VecDeque<PendingRequest>>>, pending_owners: Arc<std::sync::Mutex<HashSet<AccountOwner>>>,
     request_notifier: Arc<Notify>,
     max_batch_size: usize,
     enable_memory_profiling: bool,
@@ -1178,6 +1188,7 @@ where
             faucet_storage: Arc::clone(&self.faucet_storage),
             storage_path: self.storage_path.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
+            pending_owners: Arc::clone(&self.pending_owners),
             request_notifier: Arc::clone(&self.request_notifier),
             max_batch_size: self.max_batch_size,
             enable_memory_profiling: self.enable_memory_profiling,
@@ -1242,6 +1253,7 @@ where
 
         // Initialize batching components
         let pending_requests = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_owners = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let request_notifier = Arc::new(Notify::new());
 
         Ok(Self {
@@ -1262,6 +1274,7 @@ where
             faucet_storage,
             storage_path,
             pending_requests,
+            pending_owners,
             request_notifier,
             max_batch_size: config.max_batch_size,
             enable_memory_profiling: config.enable_memory_profiling,
@@ -1278,6 +1291,7 @@ where
         let mutation_root = MutationRoot {
             faucet_storage: Arc::clone(&self.faucet_storage),
             pending_requests: Arc::clone(&self.pending_requests),
+            pending_owners: Arc::clone(&self.pending_owners),
             request_notifier: Arc::clone(&self.request_notifier),
             storage: self.storage.clone(),
             initial_claim_amount: self.initial_claim_amount,
